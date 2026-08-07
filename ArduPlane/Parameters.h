@@ -529,6 +529,10 @@ public:
     AC_PrecLand precland;
 #endif
 
+#if AP_EMERGENCYDESCENT_ENABLED
+    AP_EmergencyDescent emergency_descent;
+#endif
+
     // crow flaps weighting
     AP_Int8 crow_flap_weight_outer;
     AP_Int8 crow_flap_weight_inner;

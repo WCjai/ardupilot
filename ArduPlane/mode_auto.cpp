@@ -44,6 +44,14 @@ bool ModeAuto::_enter()
 
 void ModeAuto::_exit()
 {
+#if AP_EMERGENCYDESCENT_ENABLED
+    // Leaving AUTO always cancels the descent: a pilot mode change must win at
+    // every phase, including mid-descent.
+    if (plane.g2.emergency_descent.is_active()) {
+        gcs().send_text(MAV_SEVERITY_CRITICAL, "EMG: aborted, left AUTO");
+        plane.g2.emergency_descent.abort();
+    }
+#endif
     if (plane.mission.state() == AP_Mission::MISSION_RUNNING) {
         plane.mission.stop();
 
@@ -81,6 +89,14 @@ void ModeAuto::update()
 
 #if AP_PLANE_GLIDER_PULLUP_ENABLED
     if (pullup.in_pullup()) {
+        return;
+    }
+#endif
+
+#if AP_EMERGENCYDESCENT_ENABLED
+    // The emergency descent drives roll/pitch/throttle itself once started;
+    // when it is active it fully replaces the normal AUTO navigation.
+    if (plane.update_emergency_descent()) {
         return;
     }
 #endif
@@ -123,6 +139,17 @@ void ModeAuto::update()
 
 void ModeAuto::navigate()
 {
+#if AP_EMERGENCYDESCENT_ENABLED
+    // While holding at the entry gate the aircraft must orbit, not overfly:
+    // holding range is what preserves the stand-off distance the descent needs.
+    if (plane.g2.emergency_descent.phase() == AP_EmergencyDescent::Phase::ALIGN) {
+        plane.update_loiter(0);
+        if (AP::ahrs().home_is_set()) {
+            plane.mission.update();
+        }
+        return;
+    }
+#endif
     if (AP::ahrs().home_is_set()) {
         plane.mission.update();
     }

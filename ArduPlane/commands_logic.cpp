@@ -200,7 +200,13 @@ bool Plane::start_command(const AP_Mission::Mission_Command& cmd)
     case MAV_CMD_NAV_DELAY:
         mode_auto.do_nav_delay(cmd);
         break;
-        
+
+#if AP_EMERGENCYDESCENT_ENABLED
+    case MAV_CMD_NAV_EMERGENCY_DESCENT_ENTRY:
+    case MAV_CMD_NAV_EMERGENCY_DESCENT_TARGET:
+        return do_emergency_descent(cmd);
+#endif
+
     default:
         // unable to use the command, allow the vehicle to try the next command
         return false;
@@ -304,6 +310,12 @@ bool Plane::verify_command(const AP_Mission::Mission_Command& cmd)        // Ret
 
      case MAV_CMD_NAV_DELAY:
          return mode_auto.verify_nav_delay(cmd);
+
+#if AP_EMERGENCYDESCENT_ENABLED
+    case MAV_CMD_NAV_EMERGENCY_DESCENT_ENTRY:
+    case MAV_CMD_NAV_EMERGENCY_DESCENT_TARGET:
+        return verify_emergency_descent(cmd);
+#endif
 
     // do commands (always return true)
     case MAV_CMD_DO_CHANGE_SPEED:
@@ -1347,4 +1359,153 @@ bool Plane::in_auto_mission_id(uint16_t command) const
 {
     return control_mode == &mode_auto && mission.get_current_nav_id() == command;
 }
+
+#if AP_EMERGENCYDESCENT_ENABLED
+/*
+  Emergency descent mission command pair.
+
+  The ENTRY command carries the entry gate and starts the descent; it looks
+  ahead in the mission for the paired TARGET command to get the aim point. The
+  TARGET command itself is a no-op when reached on its own -- the descent is
+  driven entirely from ENTRY, and reaching TARGET as a standalone nav command
+  means the descent already finished or was never started.
+ */
+bool Plane::do_emergency_descent(const AP_Mission::Mission_Command& cmd)
+{
+    if (cmd.id == MAV_CMD_NAV_EMERGENCY_DESCENT_TARGET) {
+        // Paired item; nothing to do on its own.
+        return true;
+    }
+
+    if (g2.emergency_descent.is_active()) {
+        // Already running: the mission re-entering this item (e.g. a GCS
+        // set-current) must not restart the profile and lose its progress.
+        return true;
+    }
+
+    // Find the paired TARGET: the next nav command after this one.
+    AP_Mission::Mission_Command next_cmd;
+    const uint16_t next_index = mission.get_current_nav_index() + 1;
+    if (!mission.get_next_nav_cmd(next_index, next_cmd) ||
+        next_cmd.id != MAV_CMD_NAV_EMERGENCY_DESCENT_TARGET) {
+        gcs().send_text(MAV_SEVERITY_CRITICAL,
+                        "EMG: ENTRY has no paired TARGET, skipping");
+        return false;
+    }
+
+    char reason[32];
+    if (!g2.emergency_descent.start(cmd.content.location, next_cmd.content.location,
+                                    current_loc, reason, sizeof(reason))) {
+        gcs().send_text(MAV_SEVERITY_CRITICAL, "EMG: rejected (%s)", reason);
+        return false;
+    }
+    emg_nav_target_valid = false;
+    return true;
+}
+
+bool Plane::verify_emergency_descent(const AP_Mission::Mission_Command& cmd)
+{
+    if (cmd.id == MAV_CMD_NAV_EMERGENCY_DESCENT_TARGET) {
+        return true;
+    }
+    // The descent runs from update_emergency_descent() on the AUTO path; this
+    // only reports whether it has finished so the mission can advance.
+    return !g2.emergency_descent.is_active();
+}
+
+/*
+  Run one tick of the emergency descent and apply its output. Called from the
+  AUTO update path. Returns true if the descent is driving the aircraft, in
+  which case the caller must not run its normal navigation.
+ */
+bool Plane::update_emergency_descent()
+{
+    if (!g2.emergency_descent.is_active()) {
+        return false;
+    }
+
+    // Guidance is entirely position-based; without a trusted position it must
+    // not keep flying the aircraft at the ground. Hand back to normal AUTO
+    // navigation, which has its own failsafe handling.
+    if (!have_position || !ahrs.healthy()) {
+        gcs().send_text(MAV_SEVERITY_CRITICAL, "EMG: aborted, position lost");
+        g2.emergency_descent.abort();
+        return false;
+    }
+
+    // If the mission moved on underneath us (operator uploaded a new mission,
+    // or jumped to another item) the descent is no longer what was asked for.
+    if (mission.get_current_nav_id() != MAV_CMD_NAV_EMERGENCY_DESCENT_ENTRY) {
+        gcs().send_text(MAV_SEVERITY_CRITICAL, "EMG: aborted, mission changed");
+        g2.emergency_descent.abort();
+        return false;
+    }
+
+    AP_EmergencyDescent::State st;
+    st.current = current_loc;
+    st.ground_speed = ahrs.groundspeed();
+    // climb rate is +up; AHRS reports velocity down
+    float velD = 0.0f;
+    IGNORE_RETURN(ahrs.get_velocity_D(velD));
+    st.climb_rate = -velD;
+    st.height_agl = relative_ground_altitude(RangeFinderUse::CLIMB);
+    st.roll_cd = ahrs.roll_sensor;
+    st.pitch_cd = ahrs.pitch_sensor;
+    st.heading_deg = wrap_360(degrees(ahrs.get_yaw_rad()));
+
+    const AP_EmergencyDescent::Output out = g2.emergency_descent.update(st);
+
+    switch (out.action) {
+    case AP_EmergencyDescent::Action::NAV_TO:
+    case AP_EmergencyDescent::Action::LOITER:
+        // Only re-issue when the target actually moves. set_guided_WP() does
+        // real work (terrain fix, altitude slope, turn angle) and this runs at
+        // full loop rate -- calling it every tick starves the scheduler and
+        // stalls telemetry.
+        if (!emg_nav_target_valid ||
+            emg_last_nav_target.lat != out.nav_target.lat ||
+            emg_last_nav_target.lng != out.nav_target.lng ||
+            emg_last_nav_target.alt != out.nav_target.alt) {
+            set_guided_WP(out.nav_target);
+            emg_last_nav_target = out.nav_target;
+            emg_nav_target_valid = true;
+        }
+        // Drive the L1 controller at the gate every tick. Setting next_WP_loc
+        // alone is not enough: ArduPlane tracks a waypoint because
+        // verify_nav_wp() calls update_waypoint() on every pass, and without
+        // it L1 is never told to steer, so the aircraft holds its heading and
+        // never closes on the gate. ALIGN steers via update_loiter() in
+        // ModeAuto::navigate() instead, so only NAV_TO is handled here.
+        if (out.action == AP_EmergencyDescent::Action::NAV_TO) {
+            steer_state.hold_course_cd = -1;
+            nav_controller->update_waypoint(prev_WP_loc, next_WP_loc);
+        }
+        // Return false: these phases only choose *where* to fly. The normal
+        // AUTO roll/pitch/throttle controllers must still run -- bypassing
+        // them leaves TECS unserviced and the aircraft holds its last
+        // attitude and climbs away.
+        return false;
+
+    case AP_EmergencyDescent::Action::ATTITUDE:
+        // Direct attitude control, bypassing L1 and TECS. This is the in-tree
+        // equivalent of the prototype's SET_ATTITUDE_TARGET stream, and is the
+        // only case that legitimately replaces the normal controllers.
+        nav_roll_cd = constrain_int32(out.roll_cd, -roll_limit_cd, roll_limit_cd);
+        update_load_factor();
+        nav_pitch_cd = constrain_int32(out.pitch_cd, pitch_limit_min * 100,
+                                       aparm.pitch_limit_max.get() * 100);
+        SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, out.throttle * 100.0f);
+        break;
+
+    case AP_EmergencyDescent::Action::NONE:
+        return false;
+    }
+
+    if (out.terminate) {
+        gcs().send_text(MAV_SEVERITY_CRITICAL, "EMG: impact, disarming");
+        arming.disarm(AP_Arming::Method::MISSIONEXIT);
+    }
+    return true;
+}
+#endif  // AP_EMERGENCYDESCENT_ENABLED
 

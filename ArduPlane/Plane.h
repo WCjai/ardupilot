@@ -82,6 +82,7 @@
 #include <AP_ICEngine/AP_ICEngine.h>
 #include <AP_Landing/AP_Landing.h>
 #include <AP_LandingGear/AP_LandingGear.h>     // Landing Gear library
+#include <AP_EmergencyDescent/AP_EmergencyDescent.h>  // native emergency descent
 #include <AP_Follow/AP_Follow.h>
 #include <AP_ExternalControl/AP_ExternalControl_config.h>
 #if AP_EXTERNAL_CONTROL_ENABLED
@@ -1007,6 +1008,17 @@ private:
     void do_vtol_takeoff(const AP_Mission::Mission_Command& cmd);
     void do_vtol_land(const AP_Mission::Mission_Command& cmd);
     bool verify_nav_wp(const AP_Mission::Mission_Command& cmd);
+#if AP_EMERGENCYDESCENT_ENABLED
+    bool do_emergency_descent(const AP_Mission::Mission_Command& cmd);
+    bool verify_emergency_descent(const AP_Mission::Mission_Command& cmd);
+    // last nav target handed to set_guided_WP() by the descent, so it is only
+    // re-issued when it actually changes
+    Location emg_last_nav_target;
+    bool emg_nav_target_valid;
+public:
+    bool update_emergency_descent();
+private:
+#endif
 #if HAL_QUADPLANE_ENABLED
     // vtol takeoff from AP_Vehicle for quadplane.
     bool start_takeoff(const float alt_m) override;

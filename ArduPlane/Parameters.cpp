@@ -1290,6 +1290,12 @@ const AP_Param::GroupInfo ParametersG2::var_info[] = {
     AP_GROUPINFO("RNGFND_LND_DIST", 41, ParametersG2, rangefinder_land_engage_dist_m, 0),
 #endif
 
+#if AP_EMERGENCYDESCENT_ENABLED
+    // @Group: EMG_
+    // @Path: ../libraries/AP_EmergencyDescent/AP_EmergencyDescent.cpp
+    AP_SUBGROUPINFO(emergency_descent, "EMG_", 42, ParametersG2, AP_EmergencyDescent),
+#endif
+
     AP_GROUPEND
 };
 

@@ -930,6 +930,8 @@ bool AP_Mission::stored_in_location(uint16_t id)
     case MAV_CMD_NAV_FENCE_RETURN_POINT:
     case MAV_CMD_NAV_RALLY_POINT:
     case MAV_CMD_NAV_ARC_WAYPOINT:
+    case MAV_CMD_NAV_EMERGENCY_DESCENT_ENTRY:
+    case MAV_CMD_NAV_EMERGENCY_DESCENT_TARGET:
         return true;
     default:
         return false;
@@ -1486,6 +1488,14 @@ MAV_MISSION_RESULT AP_Mission::mavlink_int_to_mission_cmd(const mavlink_mission_
         break;
 #endif  // AP_MISSION_MAV_CMD_DO_SET_ROI_WPNEXT_OFFSET_ENABLED
 
+    case MAV_CMD_NAV_EMERGENCY_DESCENT_ENTRY:
+    case MAV_CMD_NAV_EMERGENCY_DESCENT_TARGET:
+        // location carried by the common stored_in_location() block below.
+        // All descent tuning lives in the EMG_* parameters; there is no room
+        // in the 12-byte record for both a location and float parameters, so
+        // no param1..4 are stored here.
+        break;
+
     default:
         // unrecognised command
         return MAV_MISSION_UNSUPPORTED;
@@ -2019,6 +2029,12 @@ bool AP_Mission::mission_cmd_to_mavlink_int(const AP_Mission::Mission_Command& c
         packet.z = cmd.content.wpnext_offset.yaw_offset_cd * 0.01;
         break;
 #endif  // AP_MISSION_MAV_CMD_DO_SET_ROI_WPNEXT_OFFSET_ENABLED
+
+    case MAV_CMD_NAV_EMERGENCY_DESCENT_ENTRY:
+    case MAV_CMD_NAV_EMERGENCY_DESCENT_TARGET:
+        // location restored by the common stored_in_location() block below;
+        // no param1..4 were stored (see the forward conversion).
+        break;
 
     default:
         // unrecognised command
@@ -2973,6 +2989,10 @@ const char *AP_Mission::Mission_Command::type() const
     case MAV_CMD_DO_SET_ROI_WPNEXT_OFFSET:
         return "ROIWPNextOffset";
 #endif  // AP_MISSION_MAV_CMD_DO_SET_ROI_WPNEXT_OFFSET_ENABLED
+    case MAV_CMD_NAV_EMERGENCY_DESCENT_ENTRY:
+        return "EmergencyDescentEntry";
+    case MAV_CMD_NAV_EMERGENCY_DESCENT_TARGET:
+        return "EmergencyDescentTarget";
     default:
 #if CONFIG_HAL_BOARD == HAL_BOARD_SITL
         AP_HAL::panic("Mission command with ID %u has no string", id);
