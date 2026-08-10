@@ -595,3 +595,72 @@ is already active.
   (`Q_ENABLE=0`, so no VTOL). ArduPlane's TAKEOFF mode flies it fine. This also
   matches the intended workflow: the aircraft is already airborne on its normal
   mission when the operator uploads the emergency descent.
+
+## Behaviour rewrite — single-point descent (entry gate + alignment removed)
+
+**Reported problem:** near the entry point the aircraft banked left or right
+depending on target position, flying a circle before diving -- and with that
+maneuver it completely missed the entry point location; it was not flying
+through the point at all.
+
+**Root cause:** `DO_REPOSITION`/loiter at the entry gate is how a fixed-wing
+corrects heading, but the release point on that circle is essentially
+arbitrary relative to the run-in line -- the aircraft could release travelling
+in any direction relative to the intended approach, not necessarily through
+the gate. That is the wide circle the report describes.
+
+**Fix:** removed TRANSIT and ALIGN from `AP_EmergencyDescent` entirely. There
+is now one input -- a single target -- and the aircraft dives straight onto it
+under the same PN + flight-path-angle terminal guidance from `update()`,
+starting from wherever it is and whatever heading it has when the command is
+reached. That guidance law was already unchanged by this edit and is exactly
+suited to converging from an arbitrary starting position/heading; the
+entry/align machinery around it was the problem, not the terminal law itself.
+
+`MAV_CMD_NAV_EMERGENCY_DESCENT_ENTRY` (90) no longer has any special handling
+in `Plane::start_command`/`verify_command` -- an old mission containing one is
+silently skipped as an unrecognised command. `MAV_CMD_NAV_EMERGENCY_DESCENT_TARGET`
+(91) is now the sole trigger, using the aircraft's current position as the
+start of the dive. Also removed as dead code: the `NAV_TO`/`LOITER` `Action`
+variants, the ALIGN-phase loiter hook in `ModeAuto::navigate()`, and the
+`emg_last_nav_target`/`emg_nav_target_valid` L1-reissue-guard members (only
+needed for the removed NAV_TO path). `EMG_ENTRY_RAD`/`EMG_ALIGN_TOL`/
+`EMG_MIN_RNG_R` parameters removed (indices 10-12 left unused, not reassigned).
+
+### Verification
+
+**Fast harness (built-in `plane` SITL model):** confirmed the circling is
+gone -- clean monotonic convergence to 9 m closest approach on first test, no
+orbit pattern. Did not reach full impact in that specific test because the
+geometry was inadvertently too steep (180 m stand-off from ~125 m altitude,
+~35 deg required glide) -- a test-geometry artifact, not a guidance defect;
+the vertical law's convergence rate is unchanged from before.
+
+**Gazebo Alti Transition (the real target airframe) — the decisive test:**
+mission = cruise waypoint + single TARGET item, triggered by GCS jump-to-item
+after the aircraft was established in stable level cruise past the target,
+heading away from it (the actual operator workflow):
+
+```
+EMG descent: diving onto target, 549m out, from 102m
+EMG: arrived 4m from target
+EMG: impact, disarming
+closest slant 2.8m  horizontal miss 2.7m
+```
+
+**2.7 m** -- matching the earlier two-phase result (2.6-2.7 m) almost exactly,
+with the circling eliminated and the mission simplified to one point.
+
+### QGC side
+
+`MissionController::insertEmergencyDescentPattern(entry, target, ...)` became
+`insertEmergencyDescentTarget(target, ...)` -- drops one item instead of a
+linked pair. The `Emergency Descent` Plan-tab button now places a single point
+at map center. `MAV_CMD_NAV_EMERGENCY_DESCENT_ENTRY`'s command-dictionary entry
+in `MavCmdInfoCommon.json` was kept (marked legacy in its description) so an
+old saved plan still displays sensibly rather than as a raw unknown command,
+but QGC no longer creates one. Full `MissionCommandTreeEditorTest` /
+`MissionControllerTest` / `SimpleMissionItemTest` / etc. suite re-run: 8/8 pass.
+
+New firmware installed to `Plane/arduplane`; new QGroundControl built at
+`qgroundcontrol/build/Desktop_Qt_6_11_1_Debug/Debug/QGroundControl`.

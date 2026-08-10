@@ -1011,10 +1011,6 @@ private:
 #if AP_EMERGENCYDESCENT_ENABLED
     bool do_emergency_descent(const AP_Mission::Mission_Command& cmd);
     bool verify_emergency_descent(const AP_Mission::Mission_Command& cmd);
-    // last nav target handed to set_guided_WP() by the descent, so it is only
-    // re-issued when it actually changes
-    Location emg_last_nav_target;
-    bool emg_nav_target_valid;
 public:
     bool update_emergency_descent();
 private:

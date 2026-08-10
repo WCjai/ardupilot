@@ -139,17 +139,6 @@ void ModeAuto::update()
 
 void ModeAuto::navigate()
 {
-#if AP_EMERGENCYDESCENT_ENABLED
-    // While holding at the entry gate the aircraft must orbit, not overfly:
-    // holding range is what preserves the stand-off distance the descent needs.
-    if (plane.g2.emergency_descent.phase() == AP_EmergencyDescent::Phase::ALIGN) {
-        plane.update_loiter(0);
-        if (AP::ahrs().home_is_set()) {
-            plane.mission.update();
-        }
-        return;
-    }
-#endif
     if (AP::ahrs().home_is_set()) {
         plane.mission.update();
     }

@@ -89,28 +89,10 @@ const AP_Param::GroupInfo AP_EmergencyDescent::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("LOCK_DIST", 9, AP_EmergencyDescent, _lock_dist, 20.0f),
 
-    // @Param: ENTRY_RAD
-    // @DisplayName: Entry gate capture radius
-    // @Description: Transit is considered complete when the aircraft is within this distance of the entry gate. A fixed-wing cannot hold a point, so this is generous.
-    // @Units: m
-    // @Range: 30 300
-    // @User: Standard
-    AP_GROUPINFO("ENTRY_RAD", 10, AP_EmergencyDescent, _entry_rad, 110.0f),
-
-    // @Param: ALIGN_TOL
-    // @DisplayName: Run-in alignment tolerance
-    // @Description: The descent is released only when the heading error to the target is below this. Releasing loose (23 deg) missed by 7 m; tight (under 15 deg) missed by 0.5 m.
-    // @Units: deg
-    // @Range: 5 45
-    // @User: Advanced
-    AP_GROUPINFO("ALIGN_TOL", 11, AP_EmergencyDescent, _align_tol, 15.0f),
-
-    // @Param: MIN_RNG_R
-    // @DisplayName: Minimum release range ratio
-    // @Description: The descent is released only when the range to the target is still at least this fraction of the original dive distance. Prevents spending the stand-off distance the descent needs.
-    // @Range: 0.3 1.0
-    // @User: Advanced
-    AP_GROUPINFO("MIN_RNG_R", 12, AP_EmergencyDescent, _min_rng_ratio, 0.75f),
+    // Indices 10-12 previously held ENTRY_RAD/ALIGN_TOL/MIN_RNG_R for the
+    // entry-gate/alignment phases. Removed when the descent was changed to
+    // dive directly from the current position onto a single target -- see
+    // AP_EmergencyDescent.h. Left unused rather than reassigned.
 
     // @Param: DIVE_THR
     // @DisplayName: Descent throttle
@@ -160,8 +142,6 @@ const char *AP_EmergencyDescent::phase_name() const
 {
     switch (_phase) {
     case Phase::INACTIVE: return "INACTIVE";
-    case Phase::TRANSIT:  return "TRANSIT";
-    case Phase::ALIGN:    return "ALIGN";
     case Phase::DESCEND:  return "DESCEND";
     case Phase::IMPACT:   return "IMPACT";
     case Phase::COMPLETE: return "COMPLETE";
@@ -170,8 +150,8 @@ const char *AP_EmergencyDescent::phase_name() const
     return "?";
 }
 
-bool AP_EmergencyDescent::start(const Location &entry, const Location &target,
-                                const Location &current, char *reason, uint8_t reason_len)
+bool AP_EmergencyDescent::start(const Location &target, const Location &current,
+                                char *reason, uint8_t reason_len)
 {
     if (reason != nullptr && reason_len > 0) {
         reason[0] = '\0';
@@ -184,24 +164,18 @@ bool AP_EmergencyDescent::start(const Location &entry, const Location &target,
         return false;
     }
 
-    // Derive the descent geometry from the two points, exactly as the
-    // prototype does: the entry gate fully determines dive distance, approach
-    // bearing and (with the captured altitude) the dive angle.
-    _entry = entry;
     _target = target;
-    _dive_distance_m = entry.get_distance(target);
-    _approach_bearing_deg = wrap_360(degrees(target.get_bearing(entry)));
-    _run_in_bearing_deg = wrap_360(degrees(entry.get_bearing(target)));
+    _start_range_m = current.get_distance(target);
 
-    if (_dive_distance_m < 1.0f) {
+    if (_start_range_m < 1.0f) {
         if (reason) {
-            hal.util->snprintf(reason, reason_len, "entry==target");
+            hal.util->snprintf(reason, reason_len, "already at target");
         }
         return false;
     }
 
-    // Capture the entry altitude from where the aircraft actually is. An
-    // emergency descent starts from whatever height you happen to have.
+    // Capture the altitude from where the aircraft actually is. An emergency
+    // descent starts from whatever height you happen to have.
     int32_t alt_cm = 0;
     if (!current.get_alt_cm(Location::AltFrame::ABOVE_HOME, alt_cm)) {
         if (reason) {
@@ -209,16 +183,16 @@ bool AP_EmergencyDescent::start(const Location &entry, const Location &target,
         }
         return false;
     }
-    _entry_alt_agl_m = alt_cm * 0.01f;
+    _start_alt_agl_m = alt_cm * 0.01f;
 
-    if (_entry_alt_agl_m < _min_alt) {
+    if (_start_alt_agl_m < _min_alt) {
         if (reason) {
-            hal.util->snprintf(reason, reason_len, "too low (%.0fm)", (double)_entry_alt_agl_m);
+            hal.util->snprintf(reason, reason_len, "too low (%.0fm)", (double)_start_alt_agl_m);
         }
         return false;
     }
 
-    _phase = Phase::TRANSIT;
+    _phase = Phase::DESCEND;
     _phase_start_ms = AP_HAL::millis();
     _last_guidance_ms = 0;
     _have_prev_los = false;
@@ -227,9 +201,8 @@ bool AP_EmergencyDescent::start(const Location &entry, const Location &target,
     _last_output = Output{};
 
     GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
-                  "EMG descent: %.0fm run-in, brg %.0f, from %.0fm",
-                  (double)_dive_distance_m, (double)_run_in_bearing_deg,
-                  (double)_entry_alt_agl_m);
+                  "EMG descent: diving onto target, %.0fm out, from %.0fm",
+                  (double)_start_range_m, (double)_start_alt_agl_m);
     return true;
 }
 
@@ -260,59 +233,6 @@ AP_EmergencyDescent::Output AP_EmergencyDescent::update(const State &state)
     const float brg_err = wrap_180(los_deg - state.heading_deg);
 
     switch (_phase) {
-
-    case Phase::TRANSIT: {
-        // Fly direct to the entry gate. Handing the gate to the nav controller
-        // gives a straight track; the prototype had to synthesise this with
-        // repeated heading commands because it was outside the autopilot.
-        out.action = Action::NAV_TO;
-        out.nav_target = _entry;
-
-        const float d_entry = state.current.get_distance(_entry);
-        if (d_entry < _entry_rad) {
-            _phase = Phase::ALIGN;
-            _phase_start_ms = now_ms;
-            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "EMG: at entry gate (%.0fm), aligning",
-                          (double)d_entry);
-        }
-        break;
-    }
-
-    case Phase::ALIGN: {
-        // Hold at the gate until the run-in lines up. Loitering (rather than
-        // turning straight onto the target) is deliberate: turning in place
-        // spends the very stand-off distance the descent needs. The recorded
-        // prototype failure arrived 19 m out and still 42 m high, needing a 65
-        // degree dive it could not fly.
-        out.action = Action::LOITER;
-        out.nav_target = _entry;
-
-        const bool aligned = fabsf(brg_err) < _align_tol;
-        const bool far_enough = range_to_target >= (_min_rng_ratio * _dive_distance_m);
-        const bool timed_out = (now_ms - _phase_start_ms) > AP_EMG_ALIGN_TIMEOUT_MS;
-
-        if (aligned && far_enough) {
-            _phase = Phase::DESCEND;
-            _phase_start_ms = now_ms;
-            _have_prev_los = false;
-            _closest_slant_m = FLT_MAX;
-            _have_locked_roll = false;
-            GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
-                          "EMG: descending, err %.0fdeg rng %.0fm",
-                          (double)brg_err, (double)range_to_target);
-        } else if (timed_out) {
-            // In a real emergency a slightly misaligned descent beats none.
-            _phase = Phase::DESCEND;
-            _phase_start_ms = now_ms;
-            _have_prev_los = false;
-            _closest_slant_m = FLT_MAX;
-            _have_locked_roll = false;
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                          "EMG: align timeout, descending anyway (err %.0fdeg)",
-                          (double)brg_err);
-        }
-        break;
-    }
 
     case Phase::DESCEND: {
         out.action = Action::ATTITUDE;
