@@ -35,22 +35,32 @@
 /// only its target changes) once the window elapses or the terminal lock
 /// distance is reached, whichever comes first.
 ///
-/// Optional near-vertical dive (EMG_VDIVE_*, default disabled): the ANGLE-based
-/// law above commands a target pitch and converges to it through the
-/// vehicle's normal fixed-wing attitude controller -- which, like all Euler-
-/// angle attitude control, gets unreliable approaching +-90 deg (roll and yaw
-/// become coupled/degenerate there), and was found empirically to have an
-/// unexplained ceiling well short of that regardless. EMG_VDIVE instead
-/// commands a pitch ROTATION RATE (Action::RATE_PITCH_ANGLE_ROLL, applied via
-/// the vehicle's rate controller directly -- the same mechanism ACRO mode
-/// uses), which never asks for an angle to converge to and so has neither
-/// problem. It is a proportional-on-angle-error rate command (rate = Kp *
-/// (EMG_VDIVE_PITCH - current pitch), bounded by EMG_VDIVE_MAX_RATE), so it
-/// self-regulates: large rate while far from the target, tapering to zero as
-/// it's reached, no separate "reached" state needed. Roll is unaffected --
-/// still the ordinary angle-based bank from the PN law above. Active outside
-/// the terminal lock distance; inside it, hands off to the angle-based law
-/// for final aim-point precision.
+/// Optional variable-angle body-rate dive (EMG_VDIVE_*, default disabled):
+/// the ANGLE-based law above commands a target pitch and converges to it
+/// through the vehicle's normal fixed-wing attitude controller -- which,
+/// like all Euler-angle attitude control, gets unreliable approaching +-90
+/// deg (roll and yaw become coupled/degenerate there), and was found
+/// empirically to have an unexplained ceiling well short of that regardless.
+/// EMG_VDIVE instead commands a pitch ROTATION RATE
+/// (Action::RATE_PITCH_ANGLE_ROLL, applied via the vehicle's rate controller
+/// directly -- the same mechanism ACRO mode uses), which never asks for an
+/// angle to converge to and so has neither problem. Critically, the RATE
+/// law's target is not a fixed dive angle -- it tracks the same line-of-
+/// sight-derived flight-path angle the angle-based law above does (shallow
+/// far out, steepening as range closes), capped at EMG_VDIVE_PITCH as the
+/// steepest allowed. A fixed target was tried first and does not converge
+/// laterally onto the target at all: diving near-vertically leaves no
+/// altitude/time budget for lateral correction, so it just impacts near
+/// wherever it was triggered. Proportional on the remaining flight-path-
+/// angle error (rate = Kp * (target - current gamma), bounded by
+/// EMG_VDIVE_RMAX), so it self-regulates: large rate while far from the
+/// target, tapering to zero as it's reached, no separate "reached" state
+/// needed. Roll is unaffected -- still the ordinary angle-based bank from
+/// the PN law above. Pitch stays rate-controlled all the way to impact
+/// (unlike roll, the pitch geometry has no singularity approaching the
+/// target -- elev_to_tgt just smoothly approaches 90 deg as range closes to
+/// zero -- so there is no need to hand off to the angle-based law near
+/// lock_dist the way roll does).
 
 #pragma once
 
@@ -180,9 +190,9 @@ private:
     AP_Float _gamma_p;        // flight-path-angle loop gain
     AP_Float _dive_pitch;     // forced nose-down pitch target for the initial dive-in (deg)
     AP_Float _dive_time;      // duration to force _dive_pitch before the LOS law takes over (s); 0 disables
-    AP_Int8  _vdive_enable;   // enable the near-vertical body-rate dive
-    AP_Float _vdive_pitch;    // target pitch for the body-rate dive (deg, e.g. -85)
-    AP_Float _vdive_rate_p;   // gain: commanded rate (deg/s) per degree of pitch error
+    AP_Int8  _vdive_enable;   // enable the variable-angle body-rate dive
+    AP_Float _vdive_pitch;    // steepest flight-path angle the body-rate dive may command (deg, e.g. -85)
+    AP_Float _vdive_rate_p;   // gain: commanded rate (deg/s) per degree of flight-path-angle error
     AP_Float _vdive_max_rate; // max commanded pitch rate (deg/s)
     AP_Float _lock_dist;      // slant range at which lateral authority is bled (m)
     AP_Float _dive_thr;       // throttle held through the descent (0..1)
