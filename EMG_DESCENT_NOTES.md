@@ -877,3 +877,80 @@ validated 2.6-2.7m accuracy, while still reaching -85/-90 deg when a target
 close to directly below actually calls for it (reconfirmed the far-target
 pitch-channel case separately: now correctly shallow, ~3-12 deg, rather than
 forced steep regardless of range).
+
+## Descending spiral (EMG_SPIRAL_*) and the energy/turn limits
+
+Reported: from ~400 m with the target only ~50 m past the previous waypoint,
+the aircraft "passes around" rather than descending onto it, and a steep dive
+never materialises.
+
+### Why the plain dive cannot do it
+
+Not a tuning fault. The dive converts altitude into **distance** -- it must
+bend its flight path onto the line of sight, which takes travel. The angle
+that actually hits is `atan(height/range)`; at 400 m over a 50 m offset that
+is 83 deg, and the aircraft cannot rotate onto 83 deg within 50 m. It
+overflies, loops back, and only then lines up. Measured at that geometry:
+0.7 m final accuracy, but 45 s and a full circuit.
+
+Raising the rotation rate does **not** fix it and makes it worse -- the
+opposite of the intuition. `EMG_VDIVE_RMAX` 45 -> 150 deg/s gave a steeper
+nose (-75 -> -85 deg) but the miss grew 0.7 m -> 8.3 m and the descent took
+*longer* (45 s -> 65 s): over-rotating outruns what the flight path can
+follow, so the aircraft points steeply while still travelling shallowly.
+
+### What SPIRAL does
+
+Converts altitude into a **turn** instead of distance: fly to the target and
+corkscrew down over it. `Action::ORBIT` takes roll from the vehicle's own
+loiter guidance (keeps the circle centred in wind) while pitch and throttle
+stay with the descent. Radius tightens with remaining height
+(`EMG_SPIRAL_CONV`) so the helix ends on the target instead of leaving an
+offset to fly off at the bottom -- a fixed 40 m orbit released 51 m out and
+converted only 2 m of it, impacting 49 m away.
+
+Pitch is issued as a body **rate**, sharing the dive's path. Driven as an
+angle target it is capped near -20 deg by the vehicle's angle controller (the
+same ceiling documented earlier in this file), which starved the helix of
+descent rate: ~8 m/s, i.e. ~47 s from 400 m. That is precisely why the spiral
+was first observed to "work but be slow". With rate control it reached -70 deg.
+
+### Two hard limits, both measured
+
+**A steep spiral is self-contradictory.** Turning needs the lift vector to
+have a horizontal component. Past roughly 45 deg nose-down the aircraft is
+near enough vertical that bank rotates it about an axis aimed at the ground
+rather than curving its path. Commanding -55 deg (achieving -70), the orbit
+radius was varied from 3 m to over 73 m and the trajectory did not change *at
+all* -- identical impact point to within 0.1 m, because the orbit guidance had
+no authority over the path. A steep `EMG_SPIRAL_PTCH` does not buy a fast
+spiral; it buys a plain steep dive that wanders off.
+
+**Radius is bounded by speed.** Turn radius grows as V^2 and steep nose-down
+at idle builds speed fast, so demanding tighter than the achievable radius
+makes the aircraft depart the turn tangentially and leave entirely -- measured
+as a 125 m impact. The radius is now floored at
+`1.15 * V^2 / (g * tan(roll_lim))`.
+
+### Where that leaves it
+
+| mode | accuracy | speed | stays over target |
+|---|---|---|---|
+| plain dive (SPIRAL off) | 0.7 m | ~45 s | no, overflies and loops |
+| shallow spiral | ~flyable radius | slow | yes |
+| steep spiral | departs | fast | no -- degenerates to a dive |
+
+Neither of the first two dominates. Fast + steep + localised together needs a
+**drag device** (flaps, spoilers, airbrakes, split ailerons): drag lets the
+aircraft hold a steep path without the speed run-away that widens the turn.
+ArduPlane routes all of them through `k_flap_auto`, so support would be a
+small airframe-agnostic addition -- but the Alti Transition has ailerons and
+elevator only (and the Gazebo model drives both ailerons from one channel, so
+even flaperons cannot be simulated), so it was not pursued. The built-in SITL
+`plane` model has no flap simulation at all, so drag cannot be evaluated there
+regardless.
+
+Practical recommendation absent a drag device: leave SPIRAL off and give the
+target run-in distance. At ~350 m stand-off the plain dive measured
+0.18-1.79 m with no circling at all; the pathological case is specifically a
+close target from high altitude.
