@@ -50,6 +50,7 @@ void ModeAuto::_exit()
     if (plane.g2.emergency_descent.is_active()) {
         gcs().send_text(MAV_SEVERITY_CRITICAL, "EMG: aborted, left AUTO");
         plane.g2.emergency_descent.abort();
+        plane.emergency_descent_set_assist(true);
     }
 #endif
     if (plane.mission.state() == AP_Mission::MISSION_RUNNING) {

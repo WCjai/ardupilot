@@ -25,6 +25,15 @@
 ///  - guidance runs at a fixed sub-rate so line-of-sight-rate differentiation
 ///    is not amplified by the full loop rate;
 ///  - vertical guidance drives the flight-path angle, not just the nose.
+///
+/// Optional aggressive dive-in (EMG_DIVE_PITCH / EMG_DIVE_TIME, default
+/// disabled): for the first EMG_DIVE_TIME seconds of the descent the vertical
+/// law's target flight-path angle is forced to EMG_DIVE_PITCH instead of the
+/// line-of-sight elevation to the target, so the aircraft pitches down hard
+/// immediately rather than gradually steepening as range closes. It hands off
+/// to the ordinary line-of-sight law smoothly (same proportional controller,
+/// only its target changes) once the window elapses or the terminal lock
+/// distance is reached, whichever comes first.
 
 #pragma once
 
@@ -143,6 +152,8 @@ private:
     AP_Float _pitch_min;      // min (most nose-down) pitch (deg)
     AP_Float _pitch_max;      // max (nose-up) pitch (deg)
     AP_Float _gamma_p;        // flight-path-angle loop gain
+    AP_Float _dive_pitch;     // forced nose-down pitch target for the initial dive-in (deg)
+    AP_Float _dive_time;      // duration to force _dive_pitch before the LOS law takes over (s); 0 disables
     AP_Float _lock_dist;      // slant range at which lateral authority is bled (m)
     AP_Float _dive_thr;       // throttle held through the descent (0..1)
     AP_Int8  _rate_hz;        // guidance sub-rate (Hz)

@@ -117,6 +117,22 @@ const AP_Param::GroupInfo AP_EmergencyDescent::var_info[] = {
     // @User: Standard
     AP_GROUPINFO("MIN_ALT", 15, AP_EmergencyDescent, _min_alt, AP_EMG_MIN_START_ALT_M),
 
+    // @Param: DIVE_PITCH
+    // @DisplayName: Aggressive dive-in pitch
+    // @Description: Forced nose-down pitch target for the first EMG_DIVE_TIME seconds of the descent, overriding the normal line-of-sight vertical law so the aircraft pitches down immediately instead of gradually steepening as range closes. Only takes effect if EMG_DIVE_TIME is non-zero. Still bounded by EMG_PITCH_MIN.
+    // @Units: deg
+    // @Range: -80 0
+    // @User: Advanced
+    AP_GROUPINFO("DIVE_PITCH", 16, AP_EmergencyDescent, _dive_pitch, -70.0f),
+
+    // @Param: DIVE_TIME
+    // @DisplayName: Aggressive dive-in duration
+    // @Description: How long, from the start of the descent, to force EMG_DIVE_PITCH before handing off to the ordinary line-of-sight vertical law. 0 disables the forced dive-in entirely (line-of-sight law runs from the start, as in the original validated behaviour).
+    // @Units: s
+    // @Range: 0 15
+    // @User: Advanced
+    AP_GROUPINFO("DIVE_TIME", 17, AP_EmergencyDescent, _dive_time, 0.0f),
+
     AP_GROUPEND
 };
 
@@ -276,7 +292,19 @@ AP_EmergencyDescent::Output AP_EmergencyDescent::update(const State &state)
                                                  MAX(range_to_target, 0.1f)));
         const float sin_gamma = constrain_float(state.climb_rate / V, -1.0f, 1.0f);
         const float gamma_now = degrees(asinf(sin_gamma));
-        const float gamma_des = -elev_to_tgt;
+
+        // Aggressive dive-in: for the first EMG_DIVE_TIME seconds, force the
+        // target flight-path angle to EMG_DIVE_PITCH instead of the natural
+        // line-of-sight elevation, so the nose goes down immediately rather
+        // than steepening gradually as range closes. Same proportional
+        // controller either way, so the handoff back to the line-of-sight
+        // law is smooth, not a discontinuous jump. Left off inside the
+        // terminal lock zone -- that phase needs the line-of-sight law.
+        const float phase_elapsed_s = (now_ms - _phase_start_ms) * 0.001f;
+        const bool dive_in_active = (_dive_time > 0.0f) &&
+                                     (phase_elapsed_s < _dive_time) &&
+                                     (slant >= _lock_dist);
+        const float gamma_des = dive_in_active ? _dive_pitch : -elev_to_tgt;
         float pitch_deg = (state.pitch_cd * 0.01f) + _gamma_p * (gamma_des - gamma_now);
         pitch_deg = constrain_float(pitch_deg, _pitch_min, _pitch_max);
 

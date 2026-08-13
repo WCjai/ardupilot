@@ -1378,6 +1378,26 @@ bool Plane::in_auto_mission_id(uint16_t command) const
   one is left in an old mission it is simply skipped as an unrecognised
   command.
  */
+// Enable/disable QuadPlane's VTOL stability assist. It exists to catch
+// loss of control during ordinary flight -- attitude drifting outside the
+// configured envelope with the controller unable to track it -- which is
+// indistinguishable, from its point of view, from the descent deliberately
+// diving at up to EMG_PITCH_MIN/EMG_DIVE_PITCH. Left enabled, it engages the
+// VTOL motors mid-descent and fights the commanded attitude back toward
+// level, silently capping the achievable dive far short of what EMG_* asks
+// for. No-op on non-QuadPlane builds.
+void Plane::emergency_descent_set_assist(bool enabled)
+{
+#if HAL_QUADPLANE_ENABLED
+    if (quadplane.available()) {
+        quadplane.assist.set_state(enabled ? VTOL_Assist::STATE::ASSIST_ENABLED
+                                            : VTOL_Assist::STATE::ASSIST_DISABLED);
+    }
+#else
+    (void)enabled;
+#endif
+}
+
 bool Plane::do_emergency_descent(const AP_Mission::Mission_Command& cmd)
 {
     if (g2.emergency_descent.is_active()) {
@@ -1391,6 +1411,7 @@ bool Plane::do_emergency_descent(const AP_Mission::Mission_Command& cmd)
         gcs().send_text(MAV_SEVERITY_CRITICAL, "EMG: rejected (%s)", reason);
         return false;
     }
+    emergency_descent_set_assist(false);
     return true;
 }
 
@@ -1419,6 +1440,7 @@ bool Plane::update_emergency_descent()
     if (!have_position || !ahrs.healthy()) {
         gcs().send_text(MAV_SEVERITY_CRITICAL, "EMG: aborted, position lost");
         g2.emergency_descent.abort();
+        emergency_descent_set_assist(true);
         return false;
     }
 
@@ -1427,6 +1449,7 @@ bool Plane::update_emergency_descent()
     if (mission.get_current_nav_id() != MAV_CMD_NAV_EMERGENCY_DESCENT_TARGET) {
         gcs().send_text(MAV_SEVERITY_CRITICAL, "EMG: aborted, mission changed");
         g2.emergency_descent.abort();
+        emergency_descent_set_assist(true);
         return false;
     }
 
@@ -1448,10 +1471,19 @@ bool Plane::update_emergency_descent()
     case AP_EmergencyDescent::Action::ATTITUDE:
         // Direct attitude control, bypassing L1 and TECS. This is the in-tree
         // equivalent of the prototype's SET_ATTITUDE_TARGET stream.
-        nav_roll_cd = constrain_int32(out.roll_cd, -roll_limit_cd, roll_limit_cd);
+        //
+        // out.roll_cd/out.pitch_cd are already clamped inside the guidance
+        // library to EMG_ROLL_LIM / EMG_PITCH_MIN / EMG_PITCH_MAX -- the
+        // bounds actually tuned for this maneuver. Re-clamping here to the
+        // vehicle's normal cruise limits (ROLL_LIMIT_DEG / PTCH_LIM_MIN_DEG)
+        // would silently cap an emergency dive to ordinary cruise-flight
+        // envelope regardless of what EMG_* was set to -- e.g. EMG_PITCH_MIN
+        // defaults to -60 deg but PTCH_LIM_MIN_DEG defaults to only -25 deg,
+        // so the descent could never pitch down past -25 no matter how the
+        // EMG_* params were tuned. Use the guidance output directly.
+        nav_roll_cd = out.roll_cd;
         update_load_factor();
-        nav_pitch_cd = constrain_int32(out.pitch_cd, pitch_limit_min * 100,
-                                       aparm.pitch_limit_max.get() * 100);
+        nav_pitch_cd = out.pitch_cd;
         SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, out.throttle * 100.0f);
         break;
 
@@ -1462,6 +1494,11 @@ bool Plane::update_emergency_descent()
     if (out.terminate) {
         gcs().send_text(MAV_SEVERITY_CRITICAL, "EMG: impact, disarming");
         arming.disarm(AP_Arming::Method::MISSIONEXIT);
+    }
+    if (out.complete) {
+        // Covers both IMPACT and an internal ABORTED (overshoot/timeout) --
+        // either way the descent is done driving the aircraft.
+        emergency_descent_set_assist(true);
     }
     return true;
 }

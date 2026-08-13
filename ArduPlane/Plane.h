@@ -1011,6 +1011,11 @@ private:
 #if AP_EMERGENCYDESCENT_ENABLED
     bool do_emergency_descent(const AP_Mission::Mission_Command& cmd);
     bool verify_emergency_descent(const AP_Mission::Mission_Command& cmd);
+    // QuadPlane's VTOL stability assist fights large, deliberate attitude
+    // excursions (it exists to catch loss of control in normal flight), so
+    // it must be held off for the duration of the descent -- restored on
+    // every exit path (impact, abort, mode change).
+    void emergency_descent_set_assist(bool enabled);
 public:
     bool update_emergency_descent();
 private:
