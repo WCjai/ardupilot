@@ -664,3 +664,83 @@ but QGC no longer creates one. Full `MissionCommandTreeEditorTest` /
 
 New firmware installed to `Plane/arduplane`; new QGroundControl built at
 `qgroundcontrol/build/Desktop_Qt_6_11_1_Debug/Debug/QGroundControl`.
+
+## Aggressive dive-in (EMG_DIVE_PITCH / EMG_DIVE_TIME)
+
+Request: allow a much steeper, immediate nose-down at the start of the
+descent, rather than the existing line-of-sight law's gradual steepening as
+range closes.
+
+### Design
+
+Opt-in, `EMG_DIVE_TIME` defaults to 0 (disabled, exactly the previously
+validated behaviour). While non-zero: for the first `EMG_DIVE_TIME` seconds of
+`Phase::DESCEND`, the vertical law's `gamma_des` is forced to `EMG_DIVE_PITCH`
+(deg) instead of `-elev_to_tgt`. Same proportional flight-path-angle
+controller either way -- only the target changes -- so the handoff back to
+the line-of-sight law at the end of the window is a continuation, not a
+discontinuous jump. Turned off early if the terminal lock distance
+(`EMG_LOCK_DIST`) is reached, since that phase needs the line-of-sight law.
+`AP_EmergencyDescent.cpp`, `update()`, DESCEND case.
+
+### Two bugs found and fixed while validating
+
+1. **`commands_logic.cpp`'s ATTITUDE action re-clamped the wrong limits.**
+   `nav_roll_cd`/`nav_pitch_cd` were being constrained to the vehicle's normal
+   cruise limits (`ROLL_LIMIT_DEG` / `PTCH_LIM_MIN_DEG`, e.g. -25 deg by
+   default) after the guidance library had already clamped its own output to
+   `EMG_ROLL_LIM`/`EMG_PITCH_MIN`/`EMG_PITCH_MAX`. This meant `EMG_PITCH_MIN`
+   (default -60 deg) could never actually have taken the aircraft past -25
+   deg, regardless of how it was tuned -- a latent bug predating this session,
+   just never exercised because the line-of-sight law rarely demands anything
+   that steep on its own. Fixed by using the guidance output directly.
+
+2. **QuadPlane's VTOL stability assist (`Q_ASSIST_ANGLE`, default 30 deg)
+   fights large attitude excursions by design** -- it exists to catch loss of
+   control in ordinary flight, and cannot distinguish that from a descent
+   deliberately diving steeply. Now suppressed
+   (`quadplane.assist.set_state(ASSIST_DISABLED)`) for the duration of the
+   descent and restored on every exit path: impact/internal-abort (via
+   `out.complete` in `update_emergency_descent()`), position-lost,
+   mission-changed, and mode-change (`ModeAuto::_exit()`).
+
+### Verification and an open question
+
+Fast SITL harness (built-in `plane` model, `Q_ENABLE=0` so QuadPlane/assist is
+entirely inactive there) and the real Gazebo Alti Transition (`Q_ENABLE=1`,
+genuine QuadPlane) both show the dive-in working directionally: achieved pitch
+in the first ~1s is markedly steeper than the baseline line-of-sight-only law
+(baseline stays within about -3 to -5 deg on both rigs; with dive-in enabled
+both rigs reach roughly -19 to -20 deg).
+
+Both rigs converge to essentially the *same* ~-20 deg ceiling despite fix #2
+only being relevant to one of them (QuadPlane assist can't be the shared
+cause, since it's compile-available but runtime-inactive on the fast
+harness). Confirmed via direct GCS_SEND_TEXT instrumentation at each stage of
+the pipeline: `AP_EmergencyDescent::update()` computes and clamps to exactly
+-60 deg (`EMG_PITCH_MIN`) every guidance tick during the window; that exact
+value is what `commands_logic.cpp` writes into `nav_pitch_cd`
+(`DBG3 wrote nav_pitch_cd=-6000`, constant); `calc_nav_pitch()`
+(TECS's writer) is confirmed to never fire during the descent (gated out
+correctly by `ModeAuto::update()`'s early return). Yet by the time
+`stabilize_pitch_get_pitch_out()` reads `nav_pitch_cd` moments later, it has
+already fallen to roughly -18 to -20 deg and continues decaying back toward
+the eventual line-of-sight value even while the write stays pinned at -60 --
+with no other writer of `nav_pitch_cd` found via exhaustive
+`grep -rn "nav_pitch_cd" ArduPlane/*.cpp` review (all other write sites are
+gated to modes/paths that are not active during a fixed-wing AUTO descent).
+
+Working theory, not yet confirmed: `AP_FW_Controller::run_angle_control()`'s
+input-shaping path (`PTCH2SRV_ACCEL` default 500 deg/s^2, `shape_pos_vel_accel()`)
+tracks a shaped `angle_target_deg` rather than the raw `desired_angle_deg`
+instantaneously, and something in that shaping/rate-limit pipeline is
+producing a much lower effective ceiling than the nominal accel/rate limits
+would predict by hand calculation. Next step if picked back up: dataflash
+`PIDP` log review (far more precise than STATUSTEXT polling) of `angle_target_deg`
+and `desired_rate_degs` through `run_angle_control()` during a live dive-in
+trigger, to see exactly where the shaped trajectory stalls.
+
+Net effect either way: dive-in is a real, measurable improvement over the
+line-of-sight-only baseline (roughly 4-6x steeper achieved pitch in the first
+second) and is off by default, so it changes nothing for existing missions
+unless `EMG_DIVE_TIME` is explicitly set.
