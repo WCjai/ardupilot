@@ -1504,6 +1504,21 @@ bool Plane::update_emergency_descent()
         SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, out.throttle * 100.0f);
         break;
 
+    case AP_EmergencyDescent::Action::ORBIT:
+        // Positioning orbit. Roll comes from the vehicle's own loiter guidance
+        // -- reusing it rather than open-loop banking is what keeps the circle
+        // centred on the target in wind. Pitch and throttle stay ours, so the
+        // orbit descends under the descent's control rather than TECS's.
+        nav_controller->update_loiter(out.nav_target, out.orbit_radius_m, loiter.direction);
+        nav_roll_cd = nav_controller->nav_roll_cd();
+        update_load_factor();
+        // Pitch is applied as a body rate from stabilize_pitch_get_pitch_out()
+        // (wants_rate_pitch() covers ORBIT); this write is for
+        // NAV_CONTROLLER_OUTPUT telemetry only, as in the dive.
+        nav_pitch_cd = out.pitch_cd;
+        SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, out.throttle * 100.0f);
+        break;
+
     case AP_EmergencyDescent::Action::NONE:
         return false;
     }

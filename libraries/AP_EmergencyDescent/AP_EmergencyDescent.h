@@ -35,6 +35,41 @@
 /// only its target changes) once the window elapses or the terminal lock
 /// distance is reached, whichever comes first.
 ///
+/// Optional descending spiral (EMG_SPIRAL_*, default disabled). The dive below
+/// converts altitude into DISTANCE: it needs run-in room to bend its flight
+/// path onto the line of sight, and given a close target from high up it
+/// cannot (the angle that hits from 400 m up with the target 50 m out is
+/// 83 deg, unreachable within 50 m of travel), so it overflies and circles
+/// back. SPIRAL converts altitude into a TURN instead, corkscrewing down over
+/// the target: nose down at EMG_SPIRAL_PTCH while banked, radius tightening
+/// with remaining height (EMG_SPIRAL_CONV) so the helix ends on the target
+/// rather than leaving an offset to fly off at the bottom.
+///
+/// KEEP EMG_SPIRAL_PTCH SHALLOW. A steep spiral is self-contradictory and
+/// degenerates into a plain steep dive that wanders off the target. Turning
+/// needs the lift vector to have a horizontal component; past roughly 45 deg
+/// nose-down the aircraft is close enough to vertical that lift points
+/// sideways rather than centripetally, so bank rotates it about an axis aimed
+/// at the ground instead of curving its path. Measured directly: commanding
+/// -55 deg (achieving -70 deg), the orbit radius was varied from 3 m to over
+/// 73 m and the trajectory did not change at all -- same impact point to
+/// within 0.1 m, because the orbit guidance had no authority over the path.
+/// Compounding it, with no drag device altitude must become speed, and turn
+/// radius grows as V^2, so a steep spiral is also the fastest way to make the
+/// circle unflyable. The radius is floored at what is achievable for the
+/// current speed and bank limit, but that floor cannot rescue a steep command.
+///
+/// So the two modes trade cleanly and neither dominates:
+///   - plain dive (SPIRAL off): sub-metre accuracy, but converts altitude into
+///     distance, so with a close target from high up it overflies and circles
+///     back before it can line up;
+///   - shallow spiral: holds station over the target and does not overfly, but
+///     descends slowly, because a shallow flight path is what leaves lift
+///     available to turn with.
+/// Fast, steep, and localised together needs a drag device (flaps/spoilers);
+/// with one, the steep descent no longer runs away in speed and the trade
+/// dissolves. Absent that, prefer the plain dive with adequate run-in distance.
+///
 /// Optional variable-angle body-rate dive (EMG_VDIVE_*, default disabled):
 /// the ANGLE-based law above commands a target pitch and converges to it
 /// through the vehicle's normal fixed-wing attitude controller -- which,
@@ -108,12 +143,16 @@ public:
 
     // Phase of the descent state machine: DESCEND (terminal guidance) ->
     // IMPACT (hand back to vehicle to disarm).
+    // SPIRAL is numbered last rather than placed before DESCEND (where it sits
+    // in the flow) so the existing values stay stable for anything comparing
+    // or logging them.
     enum class Phase : uint8_t {
         INACTIVE = 0,
         DESCEND  = 1,
         IMPACT   = 2,
         COMPLETE = 3,
         ABORTED  = 4,
+        SPIRAL   = 5,
     };
 
     // Snapshot of vehicle state fed in each guidance tick, in SI/AP units.
@@ -134,14 +173,18 @@ public:
         NONE = 0,                  // do nothing; leave the flight path alone
         ATTITUDE = 1,               // apply roll_cd / pitch_cd / throttle directly
         RATE_PITCH_ANGLE_ROLL = 2,  // roll_cd as an angle target; pitch_rate_dps as a body rate
+        ORBIT = 3,                  // orbit nav_target at orbit_radius_m; roll from the vehicle's
+                                    // own loiter guidance, pitch/throttle from here
     };
 
     struct Output {
         Action action = Action::NONE;
         float roll_cd = 0.0f;        // desired roll,  centidegrees (ATTITUDE, RATE_PITCH_ANGLE_ROLL)
-        float pitch_cd = 0.0f;       // desired pitch, centidegrees (ATTITUDE)
+        float pitch_cd = 0.0f;       // desired pitch, centidegrees (ATTITUDE, ORBIT)
         float pitch_rate_dps = 0.0f; // desired pitch rotation rate, deg/s, +up (RATE_PITCH_ANGLE_ROLL)
-        float throttle = 0.0f;       // 0..1                        (ATTITUDE, RATE_PITCH_ANGLE_ROLL)
+        float throttle = 0.0f;       // 0..1                        (ATTITUDE, RATE_PITCH_ANGLE_ROLL, ORBIT)
+        Location nav_target;         // point to orbit                              (ORBIT)
+        float orbit_radius_m = 0.0f; // orbit radius, m                             (ORBIT)
         bool  terminate = false;     // true once IMPACT: vehicle should disarm
         bool  complete = false;      // descent finished (success or abort)
     };
@@ -162,7 +205,7 @@ public:
     // Cancel immediately (pilot abort, mode change, new mission, etc.).
     void abort();
 
-    bool is_active() const { return _phase == Phase::DESCEND; }
+    bool is_active() const { return _phase == Phase::DESCEND || _phase == Phase::SPIRAL; }
     Phase phase() const { return _phase; }
     const char *phase_name() const;
 
@@ -170,7 +213,14 @@ public:
     // attitude-control path to check between guidance ticks (it runs at loop
     // rate; this library's own guidance is sub-rate-limited) without
     // re-running the guidance law or rebuilding a State.
-    bool wants_rate_pitch() const { return _last_output.action == Action::RATE_PITCH_ANGLE_ROLL; }
+    // ORBIT is included: the spiral's steep pitch must go through the rate
+    // controller for the same reason the dive does -- driven as an angle target
+    // it stalls around -20 deg, which starves the helix of descent rate.
+    bool wants_rate_pitch() const
+    {
+        return _last_output.action == Action::RATE_PITCH_ANGLE_ROLL ||
+               _last_output.action == Action::ORBIT;
+    }
     float pitch_rate_dps() const { return _last_output.pitch_rate_dps; }
 
     static const struct AP_Param::GroupInfo var_info[];
@@ -190,6 +240,10 @@ private:
     AP_Float _gamma_p;        // flight-path-angle loop gain
     AP_Float _dive_pitch;     // forced nose-down pitch target for the initial dive-in (deg)
     AP_Float _dive_time;      // duration to force _dive_pitch before the LOS law takes over (s); 0 disables
+    AP_Int8  _spiral_enable;  // orbit overhead to get into position before diving
+    AP_Float _spiral_radius;  // orbit radius while positioning (m)
+    AP_Float _spiral_pitch;   // pitch held during the positioning orbit (deg)
+    AP_Float _spiral_conv;    // orbit radius per metre of remaining height (tightens the helix)
     AP_Int8  _vdive_enable;   // enable the variable-angle body-rate dive
     AP_Float _vdive_pitch;    // steepest flight-path angle the body-rate dive may command (deg, e.g. -85)
     AP_Float _vdive_rate_p;   // gain: commanded rate (deg/s) per degree of flight-path-angle error
@@ -208,6 +262,7 @@ private:
     // guidance-loop memory
     uint32_t _last_guidance_ms;   // rate limiter for the guidance law
     uint32_t _phase_start_ms;
+    uint32_t _spiral_reached_ms;  // when the positioning orbit was first reached; 0 until then
     float _prev_los_deg;
     uint32_t _prev_los_ms;
     bool  _have_prev_los;

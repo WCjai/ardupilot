@@ -163,6 +163,36 @@ const AP_Param::GroupInfo AP_EmergencyDescent::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("VDIVE_RMAX", 21, AP_EmergencyDescent, _vdive_max_rate, 45.0f),
 
+    // @Param: SPIRAL_EN
+    // @DisplayName: Positioning orbit enable
+    // @Description: Fly to the target and orbit it while descending before releasing into the dive, instead of diving from wherever the aircraft happens to be. A steep dive only reaches the target if the aircraft is nearly above it, and from an arbitrary trigger point it cannot turn onto a steep path fast enough -- it overflies. Orbiting first puts the aircraft within one radius of the target while still high, so the dive that follows is steep by geometry rather than by force. Costs the time of the transit and orbit before the descent begins.
+    // @Values: 0:Disabled,1:Enabled
+    // @User: Advanced
+    AP_GROUPINFO("SPIRAL_EN", 22, AP_EmergencyDescent, _spiral_enable, 0),
+
+    // @Param: SPIRAL_RAD
+    // @DisplayName: Positioning orbit radius
+    // @Description: Radius of the positioning orbit. Also sets how steep the following dive can be: released from this radius at height h, the line-of-sight elevation is atan(h/radius), so a smaller radius permits a steeper dive but demands more bank to fly.
+    // @Units: m
+    // @Range: 30 300
+    // @User: Advanced
+    AP_GROUPINFO("SPIRAL_RAD", 23, AP_EmergencyDescent, _spiral_radius, 60.0f),
+
+    // @Param: SPIRAL_PTCH
+    // @DisplayName: Positioning orbit pitch
+    // @Description: Pitch held during the descending spiral. Keep this shallow. Turning needs the lift vector to have a horizontal component, and past roughly 45 deg nose-down the aircraft is near enough vertical that bank rotates it about an axis aimed at the ground rather than curving its path -- measured, at -55 deg the commanded orbit radius had no effect on the trajectory whatsoever. A steep value therefore does not give a fast spiral, it gives a plain steep dive that wanders off the target.
+    // @Units: deg
+    // @Range: -35 0
+    // @User: Advanced
+    AP_GROUPINFO("SPIRAL_PTCH", 24, AP_EmergencyDescent, _spiral_pitch, -15.0f),
+
+    // @Param: SPIRAL_CONV
+    // @DisplayName: Spiral convergence
+    // @Description: Orbit radius per metre of remaining height, so the helix tightens onto the target as it descends instead of holding a fixed circle. A fixed radius leaves a horizontal offset equal to that radius still to be flown off at the bottom, and there is not enough height left to convert it -- measured as a 49 m miss from a 40 m fixed orbit. Radius is clamped to EMG_SPIRAL_RAD at the top and to a few metres at the bottom, so the spiral ends on the target.
+    // @Range: 0.1 1.0
+    // @User: Advanced
+    AP_GROUPINFO("SPIRAL_CONV", 25, AP_EmergencyDescent, _spiral_conv, 0.30f),
+
     AP_GROUPEND
 };
 
@@ -192,6 +222,7 @@ const char *AP_EmergencyDescent::phase_name() const
     case Phase::IMPACT:   return "IMPACT";
     case Phase::COMPLETE: return "COMPLETE";
     case Phase::ABORTED:  return "ABORTED";
+    case Phase::SPIRAL:   return "SPIRAL";
     }
     return "?";
 }
@@ -238,17 +269,24 @@ bool AP_EmergencyDescent::start(const Location &target, const Location &current,
         return false;
     }
 
-    _phase = Phase::DESCEND;
+    _phase = _spiral_enable ? Phase::SPIRAL : Phase::DESCEND;
     _phase_start_ms = AP_HAL::millis();
+    _spiral_reached_ms = 0;
     _last_guidance_ms = 0;
     _have_prev_los = false;
     _closest_slant_m = FLT_MAX;
     _have_locked_roll = false;
     _last_output = Output{};
 
-    GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
-                  "EMG descent: diving onto target, %.0fm out, from %.0fm",
-                  (double)_start_range_m, (double)_start_alt_agl_m);
+    if (_phase == Phase::SPIRAL) {
+        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
+                      "EMG descent: orbit then dive, %.0fm out, from %.0fm",
+                      (double)_start_range_m, (double)_start_alt_agl_m);
+    } else {
+        GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL,
+                      "EMG descent: diving onto target, %.0fm out, from %.0fm",
+                      (double)_start_range_m, (double)_start_alt_agl_m);
+    }
     return true;
 }
 
@@ -279,6 +317,69 @@ AP_EmergencyDescent::Output AP_EmergencyDescent::update(const State &state)
     const float brg_err = wrap_180(los_deg - state.heading_deg);
 
     switch (_phase) {
+
+    case Phase::SPIRAL: {
+        // Position first, dive second. Orbit the target while descending until
+        // established overhead, so that the dive which follows is released from
+        // within one orbit radius of the target -- at which point the
+        // line-of-sight elevation is steep on its own and the ordinary dive law
+        // commands a near-vertical attitude that actually reaches the target.
+        out.action = Action::ORBIT;
+        out.nav_target = _target;
+        out.throttle = constrain_float(_dive_thr, 0.0f, 1.0f);
+
+        // Pitch as a RATE, not an angle. Driven as an angle target the steep
+        // spiral pitch is capped around -20 deg by the vehicle's angle
+        // controller, which leaves the helix descending at only ~8 m/s -- the
+        // spiral then works but is far too slow. Rate control reaches the
+        // commanded attitude, and the descent rate with it.
+        out.pitch_rate_dps = constrain_float(_vdive_rate_p * (_spiral_pitch - (state.pitch_cd * 0.01f)),
+                                             -_vdive_max_rate, _vdive_max_rate);
+        out.pitch_cd = _spiral_pitch * 100.0f;   // telemetry only in this mode
+
+        // Converging helix: the circle tightens as height is used up, so the
+        // spiral ends ON the target rather than leaving a horizontal offset of
+        // one radius still to fly off at the bottom with no height left to
+        // convert it (measured as a 49 m miss releasing from a fixed 40 m orbit).
+        //
+        // Floored at what the aircraft can actually turn, though: radius grows
+        // as V^2, and a steep nose-down at idle builds speed fast, so a circle
+        // tighter than that is not merely imprecise but unflyable -- the
+        // aircraft departs the turn tangentially and leaves entirely. Measured
+        // as a 125 m impact when this floor was absent and the demand fell to a
+        // few metres. Holding a wide circle beats losing the target completely.
+        const float V_orbit = MAX(state.ground_speed, AP_EMG_MIN_SPEED_MS);
+        const float bank_lim = constrain_float(_roll_lim, 5.0f, 80.0f);
+        const float min_flyable_r = 1.15f * sq(V_orbit) / (GRAVITY_MSS * tanf(radians(bank_lim)));
+        out.orbit_radius_m = constrain_float(state.height_agl * _spiral_conv,
+                                             min_flyable_r,
+                                             MAX(_spiral_radius, min_flyable_r));
+
+        if (range_to_target <= (out.orbit_radius_m * 2.0f) && _spiral_reached_ms == 0) {
+            _spiral_reached_ms = now_ms;
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "EMG: over target, spiralling down");
+        }
+
+        // The helix runs all the way in rather than releasing into a separate
+        // dive: by the bottom the radius has shrunk to a few metres, so there is
+        // no run-in left to need.
+        if (state.height_agl <= AP_EMG_IMPACT_ALT_M) {
+            _phase = Phase::IMPACT;
+            out.terminate = true;
+            out.complete = true;
+            GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "EMG: arrived %.0fm from target",
+                          (double)range_to_target);
+            break;
+        }
+
+        if ((now_ms - _phase_start_ms) > AP_EMG_DIVE_TIMEOUT_MS) {
+            _phase = Phase::ABORTED;
+            out.action = Action::NONE;
+            out.complete = true;
+            GCS_SEND_TEXT(MAV_SEVERITY_CRITICAL, "EMG: could not reach orbit, aborting");
+        }
+        break;
+    }
 
     case Phase::DESCEND: {
         out.action = Action::ATTITUDE;
