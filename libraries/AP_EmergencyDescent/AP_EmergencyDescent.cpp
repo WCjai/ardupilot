@@ -133,6 +133,36 @@ const AP_Param::GroupInfo AP_EmergencyDescent::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("DIVE_TIME", 17, AP_EmergencyDescent, _dive_time, 0.0f),
 
+    // @Param: VDIVE_EN
+    // @DisplayName: Near-vertical body-rate dive enable
+    // @Description: Command pitch as a body ROTATION RATE toward EMG_VDIVE_PITCH instead of an angle target -- the same mechanism ACRO mode uses. Angle-based attitude control (the ordinary vertical law, and EMG_DIVE_PITCH above) converges through the normal fixed-wing attitude controller, which was found empirically to have an unexplained achieved-pitch ceiling well short of its own commanded target, and which in any case becomes unreliable approaching +-90 deg (Euler angles are singular there). Body-rate control has neither problem: it never asks for an angle to converge to. Takes over from the angle-based law outside the terminal lock distance (EMG_LOCK_DIST); inside it, hands off to the angle-based law for final aim-point precision. Self-regulating -- no separate duration parameter, it simply commands less rate as EMG_VDIVE_PITCH is approached.
+    // @Values: 0:Disabled,1:Enabled
+    // @User: Advanced
+    AP_GROUPINFO("VDIVE_EN", 18, AP_EmergencyDescent, _vdive_enable, 0),
+
+    // @Param: VDIVE_PITCH
+    // @DisplayName: Near-vertical dive target pitch
+    // @Description: Target pitch for the body-rate dive. Only takes effect if EMG_VDIVE_EN is enabled.
+    // @Units: deg
+    // @Range: -90 -45
+    // @User: Advanced
+    AP_GROUPINFO("VDIVE_PITCH", 19, AP_EmergencyDescent, _vdive_pitch, -85.0f),
+
+    // @Param: VDIVE_RATE_P
+    // @DisplayName: Near-vertical dive rate gain
+    // @Description: Commanded pitch rate is this gain times the remaining pitch error to EMG_VDIVE_PITCH (deg/s per deg), bounded by EMG_VDIVE_MAXRATE. Higher converges faster but with less margin before the rate bound saturates.
+    // @Range: 0.5 6
+    // @User: Advanced
+    AP_GROUPINFO("VDIVE_RATE_P", 20, AP_EmergencyDescent, _vdive_rate_p, 3.0f),
+
+    // @Param: VDIVE_RMAX
+    // @DisplayName: Near-vertical dive max rate
+    // @Description: Commanded pitch rate is bounded to this, regardless of how far off EMG_VDIVE_PITCH the aircraft is.
+    // @Units: deg/s
+    // @Range: 10 90
+    // @User: Advanced
+    AP_GROUPINFO("VDIVE_RMAX", 21, AP_EmergencyDescent, _vdive_max_rate, 45.0f),
+
     AP_GROUPEND
 };
 
@@ -320,6 +350,25 @@ AP_EmergencyDescent::Output AP_EmergencyDescent::update(const State &state)
         } else {
             _have_locked_roll = false;
             out.roll_cd = roll_deg * 100.0f;
+        }
+
+        // ---- optional near-vertical body-rate dive (EMG_VDIVE_*): pitch is
+        // commanded as a ROTATION RATE rather than an angle target, applied
+        // via the rate controller directly (the same mechanism ACRO mode
+        // uses), so it neither goes through the angle-based law's observed
+        // ceiling nor (approaching +-90 deg) its Euler-angle singularity.
+        // Proportional on the remaining angle error, so it self-regulates --
+        // large rate while far from EMG_VDIVE_PITCH, tapering to zero as it's
+        // reached, no separate "reached" state needed. Off inside the
+        // terminal lock zone -- final aim precision there comes from the
+        // angle-based law above, which is why pitch_deg is still computed
+        // unconditionally.
+        if (_vdive_enable && slant >= _lock_dist) {
+            const float pitch_now_deg = state.pitch_cd * 0.01f;
+            const float pitch_err_deg = _vdive_pitch - pitch_now_deg;
+            out.action = Action::RATE_PITCH_ANGLE_ROLL;
+            out.pitch_rate_dps = constrain_float(_vdive_rate_p * pitch_err_deg,
+                                                  -_vdive_max_rate, _vdive_max_rate);
         }
         out.pitch_cd = pitch_deg * 100.0f;
 

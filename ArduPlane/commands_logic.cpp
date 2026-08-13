@@ -1487,6 +1487,23 @@ bool Plane::update_emergency_descent()
         SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, out.throttle * 100.0f);
         break;
 
+    case AP_EmergencyDescent::Action::RATE_PITCH_ANGLE_ROLL:
+        // Near-vertical dive-in: roll is still an ordinary angle target, but
+        // pitch is commanded as a body ROTATION RATE (out.pitch_rate_dps)
+        // instead of an angle -- see the class doc comment on
+        // AP_EmergencyDescent for why. The rate is applied to the elevator
+        // from Plane::stabilize_pitch_get_pitch_out(), which checks
+        // g2.emergency_descent.wants_rate_pitch()/pitch_rate_dps() every
+        // stabilization tick (this function only runs at EMG_RATE_HZ, far
+        // slower than that loop). nav_pitch_cd is set here only so
+        // NAV_CONTROLLER_OUTPUT telemetry shows something sane -- it is not
+        // itself applied to the elevator in this mode.
+        nav_roll_cd = out.roll_cd;
+        update_load_factor();
+        nav_pitch_cd = out.pitch_cd;
+        SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, out.throttle * 100.0f);
+        break;
+
     case AP_EmergencyDescent::Action::NONE:
         return false;
     }

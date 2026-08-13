@@ -34,6 +34,23 @@
 /// to the ordinary line-of-sight law smoothly (same proportional controller,
 /// only its target changes) once the window elapses or the terminal lock
 /// distance is reached, whichever comes first.
+///
+/// Optional near-vertical dive (EMG_VDIVE_*, default disabled): the ANGLE-based
+/// law above commands a target pitch and converges to it through the
+/// vehicle's normal fixed-wing attitude controller -- which, like all Euler-
+/// angle attitude control, gets unreliable approaching +-90 deg (roll and yaw
+/// become coupled/degenerate there), and was found empirically to have an
+/// unexplained ceiling well short of that regardless. EMG_VDIVE instead
+/// commands a pitch ROTATION RATE (Action::RATE_PITCH_ANGLE_ROLL, applied via
+/// the vehicle's rate controller directly -- the same mechanism ACRO mode
+/// uses), which never asks for an angle to converge to and so has neither
+/// problem. It is a proportional-on-angle-error rate command (rate = Kp *
+/// (EMG_VDIVE_PITCH - current pitch), bounded by EMG_VDIVE_MAX_RATE), so it
+/// self-regulates: large rate while far from the target, tapering to zero as
+/// it's reached, no separate "reached" state needed. Roll is unaffected --
+/// still the ordinary angle-based bank from the PN law above. Active outside
+/// the terminal lock distance; inside it, hands off to the angle-based law
+/// for final aim-point precision.
 
 #pragma once
 
@@ -104,17 +121,19 @@ public:
     // ArduPlane dependency: ATTITUDE maps directly onto direct nav_roll_cd /
     // nav_pitch_cd writes.
     enum class Action : uint8_t {
-        NONE = 0,       // do nothing; leave the flight path alone
-        ATTITUDE = 1,   // apply roll_cd / pitch_cd / throttle directly
+        NONE = 0,                  // do nothing; leave the flight path alone
+        ATTITUDE = 1,               // apply roll_cd / pitch_cd / throttle directly
+        RATE_PITCH_ANGLE_ROLL = 2,  // roll_cd as an angle target; pitch_rate_dps as a body rate
     };
 
     struct Output {
         Action action = Action::NONE;
-        float roll_cd = 0.0f;     // desired roll,  centidegrees (ATTITUDE)
-        float pitch_cd = 0.0f;    // desired pitch, centidegrees (ATTITUDE)
-        float throttle = 0.0f;    // 0..1                        (ATTITUDE)
-        bool  terminate = false;  // true once IMPACT: vehicle should disarm
-        bool  complete = false;   // descent finished (success or abort)
+        float roll_cd = 0.0f;        // desired roll,  centidegrees (ATTITUDE, RATE_PITCH_ANGLE_ROLL)
+        float pitch_cd = 0.0f;       // desired pitch, centidegrees (ATTITUDE)
+        float pitch_rate_dps = 0.0f; // desired pitch rotation rate, deg/s, +up (RATE_PITCH_ANGLE_ROLL)
+        float throttle = 0.0f;       // 0..1                        (ATTITUDE, RATE_PITCH_ANGLE_ROLL)
+        bool  terminate = false;     // true once IMPACT: vehicle should disarm
+        bool  complete = false;      // descent finished (success or abort)
     };
 
     void init();
@@ -137,6 +156,13 @@ public:
     Phase phase() const { return _phase; }
     const char *phase_name() const;
 
+    // Cheap accessors onto the cached last output, for the vehicle glue's
+    // attitude-control path to check between guidance ticks (it runs at loop
+    // rate; this library's own guidance is sub-rate-limited) without
+    // re-running the guidance law or rebuilding a State.
+    bool wants_rate_pitch() const { return _last_output.action == Action::RATE_PITCH_ANGLE_ROLL; }
+    float pitch_rate_dps() const { return _last_output.pitch_rate_dps; }
+
     static const struct AP_Param::GroupInfo var_info[];
 
 private:
@@ -154,6 +180,10 @@ private:
     AP_Float _gamma_p;        // flight-path-angle loop gain
     AP_Float _dive_pitch;     // forced nose-down pitch target for the initial dive-in (deg)
     AP_Float _dive_time;      // duration to force _dive_pitch before the LOS law takes over (s); 0 disables
+    AP_Int8  _vdive_enable;   // enable the near-vertical body-rate dive
+    AP_Float _vdive_pitch;    // target pitch for the body-rate dive (deg, e.g. -85)
+    AP_Float _vdive_rate_p;   // gain: commanded rate (deg/s) per degree of pitch error
+    AP_Float _vdive_max_rate; // max commanded pitch rate (deg/s)
     AP_Float _lock_dist;      // slant range at which lateral authority is bled (m)
     AP_Float _dive_thr;       // throttle held through the descent (0..1)
     AP_Int8  _rate_hz;        // guidance sub-rate (Hz)

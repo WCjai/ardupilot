@@ -212,6 +212,21 @@ void Plane::stabilize_pitch()
 float Plane::stabilize_pitch_get_pitch_out()
 {
     const float speed_scaler = get_speed_scaler();
+
+#if AP_EMERGENCYDESCENT_ENABLED
+    if (g2.emergency_descent.is_active() && g2.emergency_descent.wants_rate_pitch()) {
+        // Near-vertical body-rate dive (EMG_VDIVE_EN): command pitch as a
+        // ROTATION RATE directly via the rate controller, the same mechanism
+        // ACRO mode uses, bypassing the angle-based path below entirely --
+        // see the class doc comment on AP_EmergencyDescent for why. This
+        // function runs every stabilization tick; the guidance library's own
+        // rate is only recomputed at EMG_RATE_HZ and cached, which is why
+        // this reads the cached wants_rate_pitch()/pitch_rate_dps() rather
+        // than calling update() again.
+        return pitchController.run_rate_control(g2.emergency_descent.pitch_rate_dps(), speed_scaler);
+    }
+#endif
+
 #if HAL_QUADPLANE_ENABLED
     if (!quadplane.use_fw_attitude_controllers()) {
         // use the VTOL rate for control, to ensure consistency
