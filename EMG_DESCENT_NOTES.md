@@ -847,3 +847,33 @@ booted in 24s, and a subsequent full-param run then booted in under 1s. Pure
 timing flakiness from many overlapping background SITL/Gazebo processes
 across a long session, not a parameter-table bug -- if it recurs, just retry
 with a longer heartbeat wait before suspecting the param table.
+
+### Fix: fixed dive angle missed the target entirely
+
+Reported after the above shipped: with `EMG_VDIVE_EN` on, the aircraft dove
+straight down and missed the target. Confirmed as designed, not a bug --
+`EMG_VDIVE_PITCH` was a *fixed* target, so a far target got the same
+near-vertical dive as a close one, leaving no altitude/time budget for
+lateral correction once diving that steeply from an arbitrary trigger point.
+
+Fixed by tracking the same line-of-sight-derived target flight-path angle
+(`-elev_to_tgt`) the angle-based law above already computes -- shallow far
+out, steepening as range closes, naturally bounded to 0..-90 deg by the
+geometry itself -- capped at `EMG_VDIVE_PITCH` as the steepest allowed,
+rather than a fixed angle. `AP_EmergencyDescent.cpp`, DESCEND case:
+`vdive_target_deg = MAX(-elev_to_tgt, EMG_VDIVE_PITCH)`, rate law drives on
+`(vdive_target_deg - gamma_now)` rather than raw pitch error against a fixed
+target. Also dropped the "off inside lock_dist" restriction on the pitch
+component while doing this -- unlike the lateral/roll law, `elev_to_tgt` has
+no singularity approaching the target (it just smoothly approaches 90 deg as
+range closes to zero), so there was no reason to hand pitch back to the
+angle-based law near the target the way roll still needs to.
+
+Reverified against a realistic ~350m-out target (not the far stress-test
+geometry used to validate the pitch channel in isolation above): closest
+horizontal miss **0.18m** (fast harness), **1.79m** (Gazebo Alti Transition)
+-- matching or beating the original single-point line-of-sight law's
+validated 2.6-2.7m accuracy, while still reaching -85/-90 deg when a target
+close to directly below actually calls for it (reconfirmed the far-target
+pitch-channel case separately: now correctly shallow, ~3-12 deg, rather than
+forced steep regardless of range).
