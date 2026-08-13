@@ -744,3 +744,106 @@ Net effect either way: dive-in is a real, measurable improvement over the
 line-of-sight-only baseline (roughly 4-6x steeper achieved pitch in the first
 second) and is off by default, so it changes nothing for existing missions
 unless `EMG_DIVE_TIME` is explicitly set.
+
+## Near-vertical dive (EMG_VDIVE_*) -- solves the ceiling above
+
+Request: reach genuinely near-vertical (up to ~90 deg) pitch down, not just
+"more aggressive than the line-of-sight law."
+
+### The angle-based ceiling made this the wrong path to push further
+
+`EMG_DIVE_PITCH`/`EMG_DIVE_TIME` above still route through
+`AP_FW_Controller::run_angle_control()` -- the vehicle's normal ANGLE-based
+attitude controller, which converges on a target Euler angle. Two problems
+with pushing that toward 90 deg: (1) the unexplained ceiling documented above
+means it doesn't even reliably reach its own -60/-70 deg target, let alone
+-90; (2) independent of that, Euler-angle attitude control is fundamentally
+unreliable approaching +-90 deg pitch -- roll and yaw become coupled/
+degenerate there (the classic gimbal-lock problem). Raising `EMG_PITCH_MIN`
+further would not have been the right fix even if the ceiling were solved.
+
+### Design: body RATE control instead of angle control
+
+ArduPlane already has a proven pattern for exactly this: ACRO mode drives the
+elevator via `pitchController.run_rate_control(rate_degs, scaler)` -- a
+direct pitch ROTATION RATE, never an angle to converge to. No angle target
+means no ceiling from whatever is capping `run_angle_control()`, and no Euler
+singularity, since the aircraft is never asked to *hold* a specific angle near
+the pole, just to *keep rotating* until it gets there.
+
+New params (`AP_EmergencyDescent.cpp`), all opt-in (`EMG_VDIVE_EN` defaults
+to 0, changes nothing for existing missions):
+- `EMG_VDIVE_EN` -- enable
+- `EMG_VDIVE_PITCH` -- target pitch, deg (default -85)
+- `EMG_VDIVE_RATE_P` -- gain: commanded rate (deg/s) per degree of remaining
+  pitch error
+- `EMG_VDIVE_RMAX` -- max commanded rate, deg/s (default 45)
+
+`rate_dps = constrain(Kp * (EMG_VDIVE_PITCH - current_pitch), -RMAX, RMAX)` --
+proportional on the remaining angle error, computed fresh every guidance
+tick, so it self-regulates: large rate while far from the target, tapering to
+zero as it's reached. No separate "reached" state or duration parameter
+needed, unlike `EMG_DIVE_TIME` above. Only active outside `EMG_LOCK_DIST` --
+inside it, the angle-based law's aim-point precision takes over, same
+rationale as the dive-in's own handoff.
+
+### Wiring: a new Action, and where the rate actually gets applied
+
+`Output` gained `Action::RATE_PITCH_ANGLE_ROLL` and a `pitch_rate_dps` field.
+Roll is untouched -- still `out.roll_cd`, an angle target from the existing PN
+lateral law (near-90-deg pitch is a pole for roll/yaw too, but the aircraft
+doesn't need fine lateral steering during a near-vertical drop the way it
+does during a shallow glide, so the existing angle-based roll law was left
+alone rather than also converting it).
+
+The pitch rate could not just be applied inside `commands_logic.cpp` the way
+`ATTITUDE`'s `nav_pitch_cd` write is: `Plane::stabilize_pitch()` runs every
+stabilization tick (fast loop) regardless of what `ModeAuto::update()` did,
+and would immediately overwrite a direct elevator write from
+`update_emergency_descent()` (itself only called at whatever rate
+`ModeAuto::update()` runs). Fixed by adding the check inside
+`stabilize_pitch_get_pitch_out()` itself, at the top, ahead of the normal
+angle-based path:
+```cpp
+if (g2.emergency_descent.is_active() && g2.emergency_descent.wants_rate_pitch()) {
+    return pitchController.run_rate_control(g2.emergency_descent.pitch_rate_dps(), speed_scaler);
+}
+```
+`wants_rate_pitch()`/`pitch_rate_dps()` read the guidance library's cached
+`_last_output` (cheap, no need to rebuild `State` or re-run the sub-rate-
+limited guidance law from the fast loop). This is the single authoritative
+place pitch gets computed for every mode already, so there is no double-write
+risk. `commands_logic.cpp`'s new `RATE_PITCH_ANGLE_ROLL` case only sets
+`nav_roll_cd` (as before) and `nav_pitch_cd` for `NAV_CONTROLLER_OUTPUT`
+telemetry sanity -- the latter is never itself applied to the elevator in
+this mode.
+
+### Verification
+
+Fast SITL harness (built-in `plane` model): smooth, monotonic, non-
+oscillating convergence from level to **-84.7 deg** achieved pitch over ~5s,
+holding steady (self-regulating, no overshoot/hunting) until impact.
+
+Real Gazebo Alti Transition: same shape, converging to **-89.4 deg** --
+essentially a genuine vertical dive. Confirms the mechanism transfers cleanly
+to the real target airframe, and at least matches (here, exceeds) the fast
+harness's result.
+
+Both runs used a deliberately far target (~1800m) to isolate and stress the
+pitch channel, same as the dive-in tests above. In both, the aircraft
+impacted near its *starting* point rather than reaching the distant target --
+expected physics, not a bug: a near-vertical dive from ~100-130m altitude has
+essentially no altitude or time budget left for large lateral correction. This
+maneuver is only meaningful when triggered with the target close to directly
+below the aircraft; for a target still some distance away, the angle-based
+dive-in (`EMG_DIVE_TIME`) or the plain line-of-sight law remain the right
+tool, since they preserve time to glide-correct laterally.
+
+One SITL-environment note unrelated to the feature itself: a fast-harness
+boot attempt during this work appeared to hang for 50+s at a normal (if
+verbosely logged) SITL startup stage -- confirmed benign by a bisection
+against a params-disabled build, which also showed the same log lines then
+booted in 24s, and a subsequent full-param run then booted in under 1s. Pure
+timing flakiness from many overlapping background SITL/Gazebo processes
+across a long session, not a parameter-table bug -- if it recurs, just retry
+with a longer heartbeat wait before suspecting the param table.
